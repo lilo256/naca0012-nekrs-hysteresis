@@ -1,0 +1,63 @@
+[OCCA]
+# noeuds GPU -> CUDA ; si le cluster est CPU (comme celui de Marina, 36-48 CPU) -> SERIAL
+backend = CUDA
+#backend = CPU
+[GENERAL]
+startFrom = "restart0.f00000+int"
+endTime = 600.0
+checkpointInterval = 5
+polynomialOrder = 4
+stopAt = endTime
+dt = targetCFL=1+ max=1e-3 + initial=1e-9
+advectionSubCyclingSteps = 2
+timeStepper = tombo2
+checkpointControl = simulationTime
+regularization = hpfrt + nModes=1 + scalingCoeff=10
+scalars = k, tau
+
+
+#stopAt = endTime
+#numSteps = 200
+# 1er job (smoke test) : endTime = 2 ; puis 20 ; puis >= 100 en relançant avec startFrom
+
+#dt = targetCFL=3.0 + initial=1e-7 + max=1e-3
+# OBLIGATOIRE pour tourner a CFL=3 (c'est l'absence de cette ligne qui causait la divergence)
+#advectionSubCyclingSteps = 2
+#timeStepper = tombo2
+
+# avant : steps + 100 -> des milliers de fichiers .fld (~150 MB chacun)
+#checkpointControl = simulationTime
+
+#regularization = hpfrt + nModes=1 + scalingCoeff=10
+#scalars = k, tau
+
+[PROBLEMTYPE]
+equation = navierStokes+variableViscosity
+
+[FLUID PRESSURE]
+solver = PCG+flexible+maxiter=1000
+residualTol = 1e-06
+preconditioner = semfem
+initialGuess = projectionAconj+nVector=20
+smootherType = RAS+FourthOptChebyshev+maxEigenvalueBoundFactor=1.1
+#solver = GMRES+flexible
+#residualTol = 1e-04
+#preconditioner = multigrid
+#initialGuess = projectionAconj+nVector=8
+#smootherType = RAS+FourthOptChebyshev+maxEigenvalueBoundFactor=1.1
+
+[FLUID VELOCITY]
+boundaryTypeMap = inlet, outlet, sym, sym, w, w, sym, sym
+residualTol = 1e-07
+density = 1.0
+# Re = 1e6 -> comparer a la Table 4.1 de Marina (CL=1.028, CD=0.0205 a 10 deg)
+# Re = 6e6 (viscosity = 1/6000000) -> comparer a la Table 3.5 / Mesh 7 (CL=1.069, CD=0.0158)
+viscosity = 1/1000000
+
+[SCALAR k]
+boundaryTypeMap = inlet, outlet, zeroflux, zeroflux, inlet, inlet, zeroflux, zeroflux
+residualTol = 1e-07
+
+[SCALAR tau]
+boundaryTypeMap = inlet, outlet, zeroflux, zeroflux, inlet, inlet, zeroflux, zeroflux
+residualTol = 1e-07

@@ -1,0 +1,205 @@
+C
+C  USER SPECIFIED ROUTINES: 
+C
+C     - boundary conditions 
+C     - initial conditions  
+C     - variable properties 
+C     - forcing function for fluid (f)
+C     - forcing function for passive scalar (q)
+C     - general purpose routine for checking errors etc.        
+C
+c-----------------------------------------------------------------------
+      subroutine useric (ix,iy,iz,ieg)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+
+      ux   = 1.0  
+      uy   = 0.0 
+      uz   = 0.0
+      
+      if (ifield.eq.1) then
+	   temp = 0.01   ! k
+      elseif (ifield.eq.2) then
+	   temp = 0.1    ! Tau
+      endif
+      
+      
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine userchk
+      include 'SIZE'
+      include 'TOTAL'
+      
+      
+      return
+      end
+
+c-----------------------------------------------------------------------
+      subroutine usrdat   ! This routine to modify element vertices
+      include 'SIZE'      ! _before_ mesh is generated, which 
+      include 'TOTAL'     ! guarantees GLL mapping of mesh.
+      
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine usrdat2()  ! This routine to modify mesh coordinates
+      include 'SIZE'
+      include 'TOTAL'
+         integer e,f
+
+    !Set all non-periodic BCs here. This is required by gmsh2nek
+      do iel=1,nelv
+         do ifc=1,2*ndim
+            id_face = bc(5,ifc,iel,1)
+	    if (id_face.eq.1) then        ! BC1_on_INLET
+               cbc(ifc,iel,1) = 'v  '
+               boundaryID(ifc,iel) = 1
+            elseif (id_face.eq.2) then    ! BC1_on_OUTLET
+               cbc(ifc,iel,1) = 'o  '
+               boundaryID(ifc,iel) = 2
+            elseif (id_face.eq.3) then    ! BC1_on_TOP
+               cbc(ifc,iel,1) = 'sym'
+               boundaryID(ifc,iel) = 3
+            elseif (id_face.eq.4) then    ! BC1_on_BOTTOM
+               cbc(ifc,iel,1) = 'sym'
+               boundaryID(ifc,iel) = 4
+            elseif (id_face.eq.5) then    ! BC1_on_UPPSURF
+               cbc(ifc,iel,1) = 'W  '
+               boundaryID(ifc,iel) = 5
+            elseif (id_face.eq.6) then    ! BC1_on_LOWSURF
+               cbc(ifc,iel,1) = 'W  '
+               boundaryID(ifc,iel) = 6
+            elseif (id_face.eq.7) then    ! BC1_on_FRONT
+               cbc(ifc,iel,1) = 'sym'
+               boundaryID(ifc,iel) = 7
+            elseif (id_face.eq.8) then    ! BC1_on_BACK
+               cbc(ifc,iel,1) = 'sym'
+               boundaryID(ifc,iel) = 8
+
+            else                          ! Zero-out everything else
+               cbc(ifc,iel,1) = '   '
+               boundaryID(ifc,iel) = 0
+            endif
+         enddo
+      enddo
+      
+      
+   
+
+	n = lx1*ly1*lz1*nelv
+	nxz = nx1*nz1
+	nface = 2*ldim
+
+	do iel=1,nelv
+	do ifc=1,2*ndim
+	   if (abs((bc(5,ifc,iel,1)-5.0)).lt.1e-4) cbc(ifc,iel,1)= 'W  '
+	   if (abs((bc(5,ifc,iel,1)-6.0)).lt.1e-4) cbc(ifc,iel,1)= 'W  '
+	enddo
+	enddo
+   
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine usrdat3
+      include 'SIZE'
+      include 'TOTAL'
+
+      real w1(lx1*ly1*lz1*lelv), w2(lx1*ly1*lz1*lelv),
+     &     w3(lx1*ly1*lz1*lelv), w4(lx1*ly1*lz1*lelv),
+     &     w5(lx1*ly1*lz1*lelv)
+      common /scrach_o1/ w1, w2, w3, w4, w5
+
+      real ywd(lx1*ly1*lz1*lelv)
+      common /scrach_o2/ ywd
+
+      integer i, iel, k
+      character*32 fname
+
+      ! Appel corrigé : ifield = 1 (champ de vitesse)
+      ! La fonction identifie toutes les frontières 'W  ' du domaine
+      call distf(ywd, 1, 'W  ', w1, w2, w3, w4, w5)
+
+      ! Export direct
+      write(fname, '("wall_distance_rank_",I4.4,".csv")') nid
+      open(unit=77, file=fname, status='replace')
+      write(77, '("x,y,z,wall_distance")')
+      
+      i = 1
+      do iel = 1, nelv
+         do k = 1, lx1*ly1*lz1
+            write(77, '(E15.7,A,E15.7,A,E15.7,A,E15.7)') 
+     &      xm1(k,1,1,iel), ',', ym1(k,1,1,iel), ',',
+     &      zm1(k,1,1,iel), ',', ywd(i)
+            i = i + 1
+         enddo
+      enddo
+      
+      close(77)
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine usrsetvert(glo_num,nel,nx,ny,nz) ! to modify glo_num
+ 
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine shear_stress(cf,xf,u,v,w)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+
+      parameter (lt=lx1*ly1*lz1*lelt,lxyz=lx1*ly1*lz1)
+
+      real cf(lx1,lelt), xf(lx1,lelt), u(lt), v(lt), w(lt)
+
+      common /scrns/ sij(lxyz,3*(ldim-1),lelt)
+      common /scruz/ ua(lt),va(lt),wa(lt)
+      common /scrmg/ ur (lxyz) , us (lxyz) , ut (lxyz)
+     $             , vr (lxyz) , vs (lxyz) , vt (lxyz)
+     $             , wr (lxyz) , ws (lxyz) , wt (lxyz)
+
+      call comp_sij(sij,3*(ldim-1),u,v,w,ur,us,ut,vr,vs,vt,wr,ws,wt)
+
+      visc = param(2)
+
+      call rzero(cf,lx1*lelt)
+      call rzero(xf,lx1*lelt)
+
+      do e=1,nelv
+         do f=1,2*ndim
+		if (cbc(f,1,e).eq.'W  ') then
+                  if (bc(5,f,e,1).eq.5 .or. bc(5,f,e,1).eq.6) then
+
+                     do k=1,lx1
+
+                        ! 
+                        sxx = sij(k,1,e)
+                        syy = sij(k,2,e)
+                        syx = sij(k,ldim+1,e)
+
+                        ! 
+                        tnx = -uny(k,1,f,e)
+                        tny =  unx(k,1,f,e)
+
+                        ! 
+                        cf(k,e) = tnx*sxx*unx(k,1,f,e) 
+     $                          + tny*syx*unx(k,1,f,e) 
+     $                          + tnx*syx*uny(k,1,f,e) 
+     $                          + tny*syy*uny(k,1,f,e) 
+                        cf(k,e) = -visc * cf(k,e)
+
+                        xf(k,e) = xm1(k,1,1,e)
+
+                     enddo
+                  endif
+               endif
+         enddo
+      enddo
+
+      return
+      end
+c-----------------------------------------------------------------------

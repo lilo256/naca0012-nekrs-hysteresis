@@ -1,0 +1,559 @@
+//
+// nekRS User Defined File
+// Version: nec_rs_version_26
+//
+#include "udf.hpp"
+#include "plugins/RANSktau.hpp"
+#include "postProcessing.hpp"
+#include <fstream>  
+#include "pointInterpolation.hpp"
+#include "nrs.hpp"
+#include "linAlg.hpp"
+#include <iomanip>
+#ifdef __okl__
+#include "my_drag.oudf"
+#include "airfoil.oudf"
+#include "cf.okl"
+#endif
+
+#include <set>
+
+#define NEC_RS_VERSION "nec_rs_version_26"
+
+static bool simulationStarted = false;
+static dfloat rho, mueLam;
+
+static dfloat nextOutputTime = 0.0;
+static constexpr dfloat outputInterval = 0.001; 
+static constexpr dfloat timeTol = 1e-8;       
+
+// Memory declarations
+occa::memory o_cf;
+occa::memory o_visco;
+occa::memory o_dragvx, o_dragvy, o_dragvz;
+occa::memory o_dragpx, o_dragpy, o_dragpz;
+
+// Host memory
+std::vector<dfloat> cf;
+
+dfloat *dragvx, *dragvy, *dragvz;
+dfloat *dragpx, *dragpy, *dragpz;
+
+// Global device memory for friction coefficient components
+occa::memory o_cfx, o_cfy, o_cfz;
+
+// Host memory for friction coefficient components
+dfloat *cfx, *cfy, *cfz;
+
+struct Force {
+  dfloat x;
+  dfloat y;
+  dfloat z;
+};
+
+// Profiling execution wraps requested for CC
+inline void profite(const std::string& name) {
+    platform->timer.tic(name, 1);
+}
+
+inline void profite_end(const std::string& name) {
+    platform->timer.toc(name);
+}
+/* Viscous Drag and Pressure Drag */
+Force compute_dragv(nrs_t *nrs, int nbID, const occa::memory& o_bID, occa::memory &o_Sij, const dfloat scale)
+{
+  mesh_t *mesh = nrs->meshV;
+  Force dragv;
+  
+  if(o_dragvx.size() == 0) { 
+    if (dragvx) free(dragvx);
+    if (dragvy) free(dragvy);
+    if (dragvz) free(dragvz);
+
+    dragvx = (dfloat *) calloc(mesh->Nelements, sizeof(dfloat));
+    dragvy = (dfloat *) calloc(mesh->Nelements, sizeof(dfloat));
+    dragvz = (dfloat *) calloc(mesh->Nelements, sizeof(dfloat));
+
+    o_dragvx = platform->device.malloc(mesh->Nelements * sizeof(dfloat));
+    o_dragvy = platform->device.malloc(mesh->Nelements * sizeof(dfloat));
+    o_dragvz = platform->device.malloc(mesh->Nelements * sizeof(dfloat));
+  }
+
+  dragvKernel(mesh->Nelements,
+       nrs->fieldOffset,
+       nbID,
+       o_bID,
+       mesh->o_sgeo,
+       mesh->o_vmapM,
+       mesh->o_EToB,
+       nrs->fluid->o_mue, // CORRECTION v26
+       o_Sij,
+       o_dragvx,
+       o_dragvy,
+       o_dragvz);
+
+  o_dragvx.copyTo(dragvx);
+  o_dragvy.copyTo(dragvy);
+  o_dragvz.copyTo(dragvz);
+
+  dragv.x=0.0;
+  dragv.y=0.0;
+  dragv.z=0.0;
+  for (dlong i = 0; i < mesh->Nelements; i++) {
+    dragv.x += dragvx[i];
+    dragv.y += dragvy[i];
+    dragv.z += dragvz[i];
+  }
+  MPI_Allreduce(MPI_IN_PLACE, &dragv.x, 1, MPI_DFLOAT, MPI_SUM, platform->comm.mpiComm());
+  MPI_Allreduce(MPI_IN_PLACE, &dragv.y, 1, MPI_DFLOAT, MPI_SUM, platform->comm.mpiComm());
+  MPI_Allreduce(MPI_IN_PLACE, &dragv.z, 1, MPI_DFLOAT, MPI_SUM, platform->comm.mpiComm());
+  dragv.x *= scale;
+  dragv.y *= scale;
+  dragv.z *= scale;
+
+  return dragv;
+}
+
+// Pressure Drag (uses corrected pressure P = Pr - 2/3 rho k)
+Force compute_dragp(nrs_t *nrs, int nbID, const occa::memory &o_bID,
+                    occa::memory &o_P, const dfloat scale) {
+  mesh_t *mesh = nrs->meshV;
+  Force dragp;
+
+  // Retrieve constant density
+  // dfloat rho0;
+  // platform->options.getArgs("DENSITY", rho0);
+
+  if (o_dragpx.size() == 0) {
+    if (dragpx) free(dragpx);
+    if (dragpy) free(dragpy);
+    if (dragpz) free(dragpz);
+    dragpx = (dfloat*) calloc(mesh->Nelements, sizeof(dfloat));
+    dragpy = (dfloat*) calloc(mesh->Nelements, sizeof(dfloat));
+    dragpz = (dfloat*) calloc(mesh->Nelements, sizeof(dfloat));
+    o_dragpx = platform->device.malloc(mesh->Nelements * sizeof(dfloat));
+    o_dragpy = platform->device.malloc(mesh->Nelements * sizeof(dfloat));
+    o_dragpz = platform->device.malloc(mesh->Nelements * sizeof(dfloat));
+  }
+
+  dragpKernel(mesh->Nelements,
+              nrs->fieldOffset,
+              nbID,
+              o_bID,
+              mesh->o_sgeo,
+              mesh->o_vmapM,
+              mesh->o_EToB,
+              o_P,
+              o_dragpx,
+              o_dragpy,
+              o_dragpz);
+
+  o_dragpx.copyTo(dragpx);
+  o_dragpy.copyTo(dragpy);
+  o_dragpz.copyTo(dragpz);
+
+  dragp.x = dragp.y = dragp.z = 0.0;
+  for (dlong i = 0; i < mesh->Nelements; ++i) {
+    dragp.x += dragpx[i];
+    dragp.y += dragpy[i];
+    dragp.z += dragpz[i];
+  }
+  MPI_Allreduce(MPI_IN_PLACE, &dragp.x, 1, MPI_DFLOAT, MPI_SUM, platform->comm.mpiComm());
+  MPI_Allreduce(MPI_IN_PLACE, &dragp.y, 1, MPI_DFLOAT, MPI_SUM, platform->comm.mpiComm());
+  MPI_Allreduce(MPI_IN_PLACE, &dragp.z, 1, MPI_DFLOAT, MPI_SUM, platform->comm.mpiComm());
+
+  dragp.x *= scale;
+  dragp.y *= scale;
+  dragp.z *= scale;
+  return dragp;
+}
+
+Force compute_cf(nrs_t *nrs,
+                int nbID,
+                const occa::memory& o_bID,
+                occa::memory &o_Sij,
+                const dfloat UinfMag,
+                const dfloat rho,
+                const dfloat scale,
+                std::vector<dfloat> &cf_x,
+                std::vector<dfloat> &cf_y,
+                std::vector<dfloat> &cf_z)
+{
+    mesh_t *mesh = nrs->meshV;
+    Force cf_force{0.0, 0.0, 0.0};
+
+    // Initialize memory
+    if (o_cfx.size() == 0) {
+        if (cfx) free(cfx);
+        cfx = (dfloat *) calloc(mesh->Nlocal, sizeof(dfloat));
+        o_cfx = platform->device.malloc(mesh->Nlocal * sizeof(dfloat));
+    }
+
+    // Set to 0
+    platform->linAlg->fill(mesh->Nlocal, 0.0, o_cfx);
+
+    // Call kernel
+    cfKernel(mesh->Nelements, nrs->fieldOffset, nbID, o_bID,
+             mesh->o_sgeo, mesh->o_vmapM, mesh->o_EToB,
+             nrs->fluid->o_mue, o_Sij, 
+             UinfMag, rho,
+             o_cfx); 
+
+    // Copy results to host
+    o_cfx.copyTo(cfx);
+
+    // CF total in cf_x
+    cf_x.assign(cfx, cfx + mesh->Nlocal);
+    cf_y.assign(mesh->Nlocal, 0.0);
+    cf_z.assign(mesh->Nlocal, 0.0);
+
+    return cf_force;
+}
+
+
+// ====================================================================
+//  SONDES DE PRODUCTION  (balayage AoA / hysteresis du decrochage)
+//  --------------------------------------------------------------------
+//  * ALPHA_DEG doit valoir EXACTEMENT l'incidence du maillage
+//    (variable 'aoa' du .geo, convertie en degres).
+//    Les groupes A (paroi) et B (couche de cisaillement) sont definis
+//    en repere CORDE puis tournes de ALPHA_DEG : ils suivent le profil
+//    a chaque incidence SANS retoucher les coordonnees.
+//    >>> UNE SEULE LIGNE A CHANGER PAR CAS : ALPHA_DEG <<<
+//  * PROBE_EVERY : cadence d'ecriture (1 pas sur N). 20 => ~68 points
+//    par periode a St=12.26 (dt~6e-5) : largement suffisant, et un
+//    fichier 20x plus leger que l'ecriture a chaque pas.
+//  * Sortie : probes_positions.csv (une fois) + probes_uvp.csv
+//    (une ligne par echantillon : time puis ux,uy,p par sonde).
+// ====================================================================
+static constexpr dfloat ALPHA_DEG   = 13.00;   // <<< A CHANGER A CHAQUE MAILLAGE
+static constexpr int    PROBE_EVERY = 20;     // ecrire 1 pas sur 20
+static constexpr dfloat PROBE_ZMID  = 0.5;    // Extrude {0,0,1.0} -> plan median
+
+// demi-epaisseur NACA0012 et sa pente (repere corde : BA=(0,0), BF=(1,0))
+static inline dfloat nacaYt(dfloat xc) {
+  return 0.6*(0.2969*sqrt(xc) - 0.1260*xc - 0.3516*xc*xc
+              + 0.2843*xc*xc*xc - 0.1036*xc*xc*xc*xc);
+}
+static inline dfloat nacaDyt(dfloat xc) {
+  return 0.6*(0.14845/sqrt(xc) - 0.1260 - 0.7032*xc
+              + 0.8529*xc*xc - 0.4144*xc*xc*xc);
+}
+
+// --- SONDES : vitesse + pression aux points de controle ---
+void monitorVelocity(double time, int tstep) {
+  static pointInterpolation_t *interpolator = nullptr;
+  static occa::memory o_Up, o_Pp;
+  static int np = 0;
+  static std::vector<dfloat> x, y, z;
+  static std::vector<std::string> lab;
+  static std::ofstream fout;          // ouvert UNE fois (pas d'open/close par pas)
+  static int nWritten = 0;
+
+  if (!interpolator) {
+    const dfloat arad = ALPHA_DEG * M_PI / 180.0;
+    const dfloat ca = cos(arad), sa = sin(arad);
+
+    // repere corde (BA=0,0 ; BF=1,0)  ->  repere maillage (BF a l'origine)
+    // verif : BA (0,0) -> (-cos a, +sin a) ; BF (1,0) -> (0,0)
+    auto toMesh = [&](dfloat xs, dfloat ys, dfloat &X, dfloat &Y) {
+      X =  (xs - 1.0)*ca + ys*sa;
+      Y = -(xs - 1.0)*sa + ys*ca;
+    };
+    // sonde a x/c sur l'EXTRADOS, decalee de 'off' selon la normale exterieure
+    auto addSurf = [&](const char *name, dfloat xc, dfloat off) {
+      const dfloat yt  = nacaYt(xc);
+      const dfloat dyt = nacaDyt(xc);
+      const dfloat nn  = sqrt(1.0 + dyt*dyt);
+      const dfloat xs  = xc - off*dyt/nn;   // normale ext. extrados = (-y', 1)/|.|
+      const dfloat ys  = yt + off*1.0/nn;
+      dfloat X, Y; toMesh(xs, ys, X, Y);
+      lab.push_back(name); x.push_back(X); y.push_back(Y); z.push_back(PROBE_ZMID);
+    };
+    // sonde directement en repere maillage (sillage, temoins)
+    auto addMesh = [&](const char *name, dfloat X, dfloat Y, dfloat Z) {
+      lab.push_back(name); x.push_back(X); y.push_back(Y); z.push_back(Z);
+    };
+
+    // A. peigne parietal extrados, n = 0.008c au-dessus de la surface
+    //    -> suivi du point de decollement : parametre d'ordre de l'hysteresis
+    addSurf("A020", 0.20, 0.008);
+    addSurf("A035", 0.35, 0.008);
+    addSurf("A050", 0.50, 0.008);
+    addSurf("A065", 0.65, 0.008);
+    addSurf("A080", 0.80, 0.008);
+    addSurf("A092", 0.92, 0.008);
+
+    // B. couche de cisaillement decollee, decalage normal CROISSANT
+    //    (la couche s'eleve vers l'aval) -> Kelvin-Helmholtz (question
+    //    laissee ouverte par Marina)
+    addSurf("B050", 0.50, 0.030);
+    addSurf("B070", 0.70, 0.060);
+    addSurf("B090", 0.90, 0.100);
+
+    // C. sillage, DEUX echelles (lacher BF fin ~0.02c a basse incidence ;
+    //    Karman large ~0.3c au decrochage), toujours en PAIRES hors axe
+    //    (une sonde sur l'axe verrait la frequence DOUBLE)
+    addMesh("W015p", 0.15, +0.02, PROBE_ZMID);
+    addMesh("W015m", 0.15, -0.02, PROBE_ZMID);
+    addMesh("W050p", 0.50, +0.15, PROBE_ZMID);
+    addMesh("W050m", 0.50, -0.15, PROBE_ZMID);
+    addMesh("W100p", 1.00, +0.15, PROBE_ZMID);
+    addMesh("W100m", 1.00, -0.15, PROBE_ZMID);
+    addMesh("W100P", 1.00, +0.30, PROBE_ZMID);
+    addMesh("W100M", 1.00, -0.30, PROBE_ZMID);
+
+    // D. temoins : amont (spectre PLAT attendu -> tranche la question
+    //    "physique ou artefact MPI" de Fer) + paire en envergure
+    //    (uniformite z : les deux signaux doivent etre identiques)
+    addMesh("REF",   -1.60, +0.30, PROBE_ZMID);
+    addMesh("SPAN1",  1.00, +0.20, 0.50);
+    addMesh("SPAN2",  1.00, +0.20, 0.05);
+
+    np = (int) x.size();
+
+    // API v26 identique a la version precedente (validee a la compilation)
+    interpolator = new pointInterpolation_t(nrs->meshV, platform->comm.mpiComm());
+    interpolator->setPoints(x, y, z);
+    interpolator->find();
+
+    o_Up = platform->device.malloc(np * 3 * sizeof(dfloat));
+    o_Pp = platform->device.malloc(np * sizeof(dfloat));
+
+    if (platform->comm.mpiRank() == 0) {
+      std::ofstream fp("probes_positions.csv");
+      fp << "label,x,y,z\n";
+      for (int i = 0; i < np; i++)
+        fp << lab[i] << "," << std::setprecision(8) << x[i] << ","
+           << y[i] << "," << z[i] << "\n";
+      fp.close();
+
+      fout.open("probes_uvp.csv", std::ios::app);
+      if (fout.tellp() == 0) {          // header seulement si fichier neuf
+        fout << "time";
+        for (int i = 0; i < np; i++)
+          fout << ",ux_" << lab[i] << ",uy_" << lab[i] << ",p_" << lab[i];
+        fout << "\n";
+      }
+    }
+  }
+
+  if (tstep % PROBE_EVERY != 0) return;   // sous-echantillonnage
+
+  interpolator->eval(3, nrs->fieldOffset, nrs->fluid->o_U, np, o_Up);
+  interpolator->eval(1, nrs->fieldOffset, nrs->fluid->o_P, np, o_Pp);
+
+  if (platform->comm.mpiRank() == 0) {
+    std::vector<dfloat> Up(3 * np), Pp(np);
+    o_Up.copyTo(Up.data());
+    o_Pp.copyTo(Pp.data());
+
+    fout << std::scientific << std::setprecision(8) << time;
+    for (int i = 0; i < np; i++)
+      fout << "," << Up[i + 0*np] << "," << Up[i + 1*np] << "," << Pp[i];
+    fout << "\n";
+    if (++nWritten % 50 == 0) fout.flush();   // securite crash, I/O raisonnable
+  }
+}
+void userq(double time)
+{
+  RANSktau::updateSourceTerms();
+}
+
+void uservp(double time)
+{
+  RANSktau::updateProperties();
+}
+
+void UDF_Setup0(MPI_Comm comm, setupAide &options)
+{
+  options.setArgs("NUMBER OF SCALARS", "2");
+}
+
+
+void UDF_Setup()
+{
+  // Sans ces 2 lignes, mu_t et les sources k/tau ne sont JAMAIS appliques (pas de turbulence)
+  nrs->userProperties = &uservp;
+  nrs->userSource     = &userq;
+
+  // Conditions initiales explicites (memes valeurs que useric : u=(1,0,0), k=0.01, tau=0.1)
+  if (platform->options.getArgs("RESTART FILE NAME").empty()) {
+    mesh_t *mesh = nrs->meshV;
+    std::vector<dfloat> U(3 * nrs->fluid->fieldOffset, 0.0);
+    std::vector<dfloat> k(mesh->Nlocal, 0.01);
+    std::vector<dfloat> tau(mesh->Nlocal, 0.1);
+    for (int n = 0; n < mesh->Nlocal; n++) {
+      U[n + 0 * nrs->fluid->fieldOffset] = 1.0;
+    }
+    nrs->fluid->o_U.copyFrom(U.data(), U.size());
+    nrs->scalar->o_solution("k").copyFrom(k.data(), k.size());
+    nrs->scalar->o_solution("tau").copyFrom(tau.data(), tau.size());
+  }
+
+  // modele par defaut = "KTAU" (celui de Marina). Le DDES viendra plus tard.
+  RANSktau::setup(nrs->scalar->nameToIndex.find("k")->second);
+}
+
+void UDF_ExecuteStep(double time, int tstep)
+{
+
+  mesh_t *mesh = nrs->meshV;
+  // occa::memory o_k = nrs->scalar->o_U;
+
+  // =================================================================
+  // 1. FORCES GLOBALES (trainee / portance)
+  // =================================================================
+  static std::vector<int> bidWall = {5, 6};
+  static occa::memory o_bidWall;
+  static occa::memory o_Sij;
+  if (o_bidWall.size() == 0) {  // allocations UNE seule fois (avant: a chaque pas)
+    o_bidWall = platform->device.malloc(bidWall.size() * sizeof(int), bidWall.data());
+    o_Sij = platform->device.malloc(6 * nrs->fieldOffset * sizeof(dfloat));
+  }
+  const dfloat scale = 2.0;  // Cx = 2F/(rho U^2 c Lz), avec c = Lz = 1
+
+  postProcessing::strainRate(nrs, false, o_Sij);
+
+  Force dragv = compute_dragv(nrs, bidWall.size(), o_bidWall, o_Sij, scale);
+  Force dragp = compute_dragp(nrs, bidWall.size(), o_bidWall, nrs->fluid->o_P, scale);
+
+  Force drag;
+  drag.x = dragp.x + dragv.x;
+  drag.y = dragp.y + dragv.y;
+  drag.z = dragp.z + dragv.z;
+
+
+  // =================================================================
+  // 1. GLOBAL FORCE CALCULATION (Drag and Lift)
+  // =================================================================
+  // std::vector<int> bidWall = {5, 6};
+  // occa::memory o_bidWall = platform->device.malloc(bidWall.size() * sizeof(int), bidWall.data());
+  // const dfloat scale = 2.0;
+
+
+  // occa::memory o_Sij = platform->device.malloc(6 * nrs->fieldOffset * sizeof(dfloat));
+  // postProcessing::strainRate(nrs, false, o_Sij);
+
+  // Force dragv = compute_dragv(nrs, bidWall.size(), o_bidWall, o_Sij, scale);
+  // Force dragp = compute_dragp(nrs, bidWall.size(), o_bidWall, nrs->fluid->o_P, o_k, scale);
+
+  // Force drag;
+  // drag.x = dragp.x + dragv.x;
+  // drag.y = dragp.y + dragv.y;
+  // drag.z = dragp.z + dragv.z;
+
+  // =================================================================
+  // 2. VELOCITY PROBES (sillage)
+  // =================================================================
+  monitorVelocity(time, tstep);
+
+  // =================================================================
+  // 3. WALL FRICTION (Cf) AND PRESSURE COEFFICIENT (Cp) EXTRACTION
+  // =================================================================
+  const dfloat rho = 1.0;
+  const dfloat UinfMag = 1.0;
+  const dfloat Pinf = 0.0; // NEW: reference pressure
+  
+  // Extract every 3000 iterations to avoid saturating disk space
+  
+  // if (time > 20.0 && tstep % 3000 == 0) {
+  // if (tstep > 0 && tstep % 100 == 0) {  
+  if (nrs->checkpointStep) {  
+    // Calculate Cf via the force cf function
+    std::vector<dfloat> cf_x, cf_y, cf_z;
+    Force cf = compute_cf(nrs, bidWall.size(), o_bidWall, o_Sij, UinfMag, rho, scale, cf_x, cf_y, cf_z);
+    
+    int rank = platform->comm.mpiRank();
+    
+    // On utilise nrs->time qui est le temps absolu de la simulation
+    std::string filename = "resultats_csv/cf_cp_time_" + std::to_string(time) + "_rank_" + std::to_string(platform->comm.mpiRank()) + ".csv";
+    std::ofstream out(filename, std::ios::app);
+    
+    // NEW HEADER: Add the Cp column at the end
+    out << "x,y,z,cf_x,cf_y,cf_z,Cp\n";
+    out << std::scientific << std::setprecision(8);
+
+    // Retrieve spatial coordinates from the GPU
+    std::vector<dfloat> host_x(mesh->Nlocal + 4096);
+    std::vector<dfloat> host_y(mesh->Nlocal + 4096);
+    std::vector<dfloat> host_z(mesh->Nlocal + 4096);
+    mesh->o_x.copyTo(host_x.data());
+    mesh->o_y.copyTo(host_y.data());
+    mesh->o_z.copyTo(host_z.data());
+
+    // NEW: Retrieve the pressure field (P) from the GPU to the CPU
+    std::vector<dfloat> host_p(mesh->Nlocal + 4096);
+    nrs->fluid->o_P.copyTo(host_p.data());
+
+    // Iterate topology point by point
+    for (dlong e = 0; e < mesh->Nelements; ++e) {
+      for (int f = 0; f < mesh->Nfaces; ++f) {
+        const int bid = mesh->EToB[f + e * mesh->Nfaces];
+        
+        // Upper surface (5) and lower surface (6)
+        if (bid == 5 || bid == 6) {
+          for (int n = 0; n < mesh->Nfp; ++n) {
+            const dlong sid = e * mesh->Nfaces * mesh->Nfp + f * mesh->Nfp + n;
+            const dlong idM = mesh->vmapM[sid]; // exact memory pointer of the GLL point
+            
+            // NEW: Compute local pressure coefficient (Cp)
+            dfloat Cp = (host_p[idM] - Pinf) / (0.5 * rho * UinfMag * UinfMag);
+            
+            // NEW: Append Cp at the end of the line
+            out << host_x[idM] << "," 
+                << host_y[idM] << "," 
+                << host_z[idM] << ","
+                << cf_x[idM] << "," 
+                << cf_y[idM] << "," 
+                << cf_z[idM] << ","
+                << Cp << "\n";
+          }
+        }
+      }
+    }
+    out.close();
+    
+    if (rank == 0) {
+      // NEW: Update terminal message
+      std::cout << ">>> Friction (Cf) and Pressure (Cp) successfully extracted at tstep = " << tstep << "\n";
+    }
+  }
+
+  // =================================================================
+  // 4. WRITE GLOBAL FORCES
+  // =================================================================
+  if (platform->comm.mpiRank() == 0) {
+    // on ecrit l'entete UNIQUEMENT si le fichier n'existe pas encore
+    std::ifstream check("drag_results.dat");
+    bool needHeader = !check.good();
+    check.close();
+
+    // toujours en mode append : on ne perd jamais l'historique au restart
+    std::ofstream dragFile("drag_results.dat", std::ios::app);
+    if (needHeader) {
+      dragFile << "tstep time dragX dragY dragZ dragPX dragPY dragPZ dragVX dragVY dragVZ\n";
+    }
+    dragFile << std::scientific << std::setprecision(8)
+             << tstep << " " << time << " "
+             << drag.x << " " << drag.y << " " << drag.z << " "
+             << dragp.x << " " << dragp.y << " " << dragp.z << " "
+             << dragv.x << " " << dragv.y << " " << dragv.z << "\n";
+    dragFile.close();
+
+    printf("%d %.8e %.8e %.8e %.8e dragx(rs)\n", tstep, time, drag.x, dragp.x, dragv.x);
+    printf("%d %.8e %.8e %.8e %.8e dragy(rs)\n", tstep, time, drag.y, dragp.y, dragv.y);
+    printf("%d %.8e %.8e %.8e %.8e dragz(rs)\n", tstep, time, drag.z, dragp.z, dragv.z);
+  }
+
+  if (time + timeTol >= nextOutputTime) {
+    nextOutputTime += outputInterval;
+  }
+
+  
+}
+
+void UDF_LoadKernels(deviceKernelProperties& kernelInfo)
+{
+   //RANSktau::buildKernel(kernelInfo);
+}

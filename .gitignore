@@ -1,0 +1,20 @@
+# sorties de calcul (restent sur le cluster)
+*.f0*
+restart*.f0*
+.cache/
+*.out
+*.err
+drag_results.dat
+probes_uvp.csv
+resultats_csv/
+wall_distance_rank_*.csv
+cmake.log
+build.log
+# post-traitement
+__pycache__/
+*.pyc
+*.json
+*.npy
+# figures produites (a regenerer avec les scripts)
+*.png
+*.pdf

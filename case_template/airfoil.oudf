@@ -1,0 +1,31 @@
+void udfDirichlet(bcData *bc)
+{
+    // Initialisation globale pour purger la mémoire non allouée
+    bc->uxFluid = 0.0;
+    bc->uyFluid = 0.0;
+    bc->uzFluid = 0.0;
+    bc->sScalar = 0.0;
+
+    // Traduction de la ligne "Inlet" 
+    // Vitesse D: u=(1,0,0) | Scalaires D: k=10^-8, tau=10^-8
+    if (bc->id == 1) {
+        bc->uxFluid = 1.0;
+        bc->uyFluid = 0.0;
+        bc->uzFluid = 0.0;
+        
+        if (bc->idScalar == 0) bc->sScalar = 1.0e-8; // k
+        if (bc->idScalar == 1) bc->sScalar = 1.0e-8; // tau
+    }
+
+    
+    // IDs 5 et 6 correspondant à extrados et intrados.
+    // Vitesse D: u=(0,0,0) | Scalaires D: k=0, tau=0
+    if (bc->id == 5 || bc->id == 6) {
+        bc->uxFluid = 0.0;
+        bc->uyFluid = 0.0;
+        bc->uzFluid = 0.0;
+        
+        if (bc->idScalar == 0) bc->sScalar = 0.0; // k
+        if (bc->idScalar == 1) bc->sScalar = 0.0; // tau
+    }
+}

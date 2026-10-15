@@ -1,0 +1,43 @@
+@kernel void cfKernel(const dlong Nelements,
+                      const dlong offset,
+                      const dlong nbID,
+                      const dlong *bID,
+                      @restrict const dfloat *sgeo,
+                      @restrict const dlong  *vmapM,
+                      @restrict const int    *EToB,
+                      @restrict const dfloat *mue,
+                      @restrict const dfloat *SIJ,
+                      const dfloat UinfMag,
+                      const dfloat rho,
+                      @restrict       dfloat *cf)
+{
+  for (dlong e = 0; e < Nelements; ++e; @outer(0)) {
+    for (int f = 0; f < p_Nfaces; ++f) {
+      const int bid = EToB[e * p_Nfaces + f];
+      for (int i = 0; i < nbID; ++i) {
+        if (bid == bID[i]) {
+          for (int n = 0; n < p_Nfp; ++n; @inner(0)) {
+            const dfloat denom = 0.5 * rho * UinfMag * UinfMag;
+            const dlong sid = e * p_Nfaces * p_Nfp + f * p_Nfp + n;
+            const dlong idM = vmapM[sid];
+            dfloat nx = sgeo[sid * p_Nsgeo + p_NXID];
+            dfloat ny = sgeo[sid * p_Nsgeo + p_NYID];
+            const dfloat len = sqrt(nx * nx + ny * ny) + 1e-16;
+            nx /= len;
+            ny /= len;
+            dfloat tx = -ny;
+            dfloat ty =  nx;
+            if (tx < 0) { tx = -tx; ty = -ty; }
+            const dfloat sxx = SIJ[idM + 0 * offset];
+            const dfloat sxy = SIJ[idM + 1 * offset];
+            const dfloat syy = SIJ[idM + 3 * offset];
+            const dfloat tn0 = sxx * nx + sxy * ny;
+            const dfloat tn1 = sxy * nx + syy * ny;
+            const dfloat tau_t = 2.0 * mue[idM] * (tx * tn0 + ty * tn1);
+            cf[idM] = -tau_t / denom;
+          }
+        }
+      }
+    }
+  }
+}
